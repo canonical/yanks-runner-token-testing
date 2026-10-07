@@ -1,0 +1,47 @@
+name: Tmate proxy diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: Runner label to test
+        required: true
+        default: self-hosted-linux-arm64-jammy-medium
+        type: string
+
+jobs:
+  diagnose:
+    timeout-minutes: 8
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    steps:
+      - name: Capture runner and aproxy diagnostics
+        shell: bash
+        run: |
+          set +e
+          echo "runner_label=${{ inputs.runner_label }}"
+          echo "runner_name=$RUNNER_NAME"
+          echo "runner_arch=$RUNNER_ARCH"
+          echo "runner_os=$RUNNER_OS"
+          for name in http_proxy HTTP_PROXY https_proxy HTTPS_PROXY no_proxy NO_PROXY TMATE_SERVER_HOST TMATE_SERVER_PORT; do
+            printf '%s=%s\n' "$name" "${!name:-}"
+          done
+          echo '--- routes ---'
+          ip route
+          echo '--- aproxy services ---'
+          sudo snap services aproxy
+          echo '--- aproxy logs ---'
+          sudo snap logs aproxy -n=100
+          echo '--- relevant nftables rules ---'
+          sudo nft list ruleset | grep -E -A8 -B4 '54969|3127|3129|10\.141\.168|10\.146\.47' || true
+          for host in 10.141.168.202 10.141.168.230; do
+            echo "--- tcp/$host:10022 ---"
+            timeout 10 bash -c "</dev/tcp/$host/10022"
+            echo "exit=$?"
+          done
+
+      - name: Verify tmate connectivity
+        timeout-minutes: 3
+        uses: canonical/action-tmate@main
+        with:
+          connectivity-check: true
+          connect-timeout-seconds: '120'
