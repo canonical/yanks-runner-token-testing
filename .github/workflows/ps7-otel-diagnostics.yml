@@ -1,0 +1,58 @@
+name: PS7 runner OTLP diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: PS7 runner label
+        required: true
+        default: self-hosted-linux-arm64-noble-large
+        type: string
+
+jobs:
+  diagnose:
+    timeout-minutes: 10
+    runs-on: [self-hosted, reactive, "${{ inputs.runner_label }}"]
+    steps:
+      - name: Capture runner and OTLP configuration
+        shell: bash
+        run: |
+          set +e
+          echo "runner_name=$RUNNER_NAME"
+          echo "runner_arch=$RUNNER_ARCH"
+          echo "runner_label=${{ inputs.runner_label }}"
+          echo "ACTION_OTEL_EXPORTER_OTLP_ENDPOINT=${ACTION_OTEL_EXPORTER_OTLP_ENDPOINT:-<unset>}"
+          echo '--- endpoint DNS ---'
+          getent ahostsv4 otlp.actions.self-hosted-runners.internal
+          echo '--- endpoint TCP ---'
+          timeout 10 bash -c '</dev/tcp/otlp.actions.self-hosted-runners.internal/14317'
+          echo "tcp_exit=$?"
+          echo '--- collector services ---'
+          sudo snap services opentelemetry-collector
+          echo '--- collector config ---'
+          sudo sh -c 'for f in /etc/otelcol/config.d/*; do echo "### $f"; sed -n "1,240p" "$f"; done'
+          echo '--- collector logs ---'
+          sudo snap logs opentelemetry-collector -n=300
+
+      - name: Query Grafana telemetry
+        env:
+          GRAFANA_TOKEN: ${{ secrets.GRAFANA_SERVICE_ACCOUNT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          GRAFANA_URL='https://dashboard.actions.self-hosted-runners.canonical.com/k8s-pfe-gh-actions-cos-ps7-prod-default-grafana'
+          AUTH_HEADER="Authorization: Bearer ${GRAFANA_TOKEN}"
+          uid=$(curl -fsSL -H "$AUTH_HEADER" "$GRAFANA_URL/api/datasources" | jq -r 'map(select(.type == "prometheus")) | .[0].uid')
+          echo "datasource_uid=$uid"
+          query() {
+            local name="$1" expr="$2"
+            echo "--- $name ---"
+            curl -fsSL -G -H "$AUTH_HEADER" \
+              --data-urlencode "query=$expr" \
+              --data-urlencode "time=$(date +%s)" \
+              "$GRAFANA_URL/api/datasources/proxy/uid/$uid/api/v1/query" | jq .
+          }
+          exact_query="system_cpu_load_average_5m{github_runner=\"$RUNNER_NAME\"}"
+          query exact "$exact_query"
+          query runners 'count by (github_runner) (system_cpu_load_average_5m)'
+          query metric 'count(system_cpu_load_average_5m)'
